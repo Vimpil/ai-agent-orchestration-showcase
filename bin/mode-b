@@ -1,0 +1,21 @@
+#!/bin/sh
+# Mode B - standard development team (orchestrator -> explorer/planner/coder/verifier/reviewer).
+# Usage: mode-b <project-dir> "<task>"
+#
+# TRANSITIONAL host-execution path: invokes OpenCode directly on the host with
+# --auto. It is NOT the sandboxed autonomous path; see bin/autonomous.
+# MODE_B_MODEL is an environment-specific example default; override it.
+set -eu
+if [ "$#" -lt 2 ]; then
+  echo 'usage: mode-b <project-dir> "<task>"' >&2
+  exit 2
+fi
+project=$1; task=$2
+if [ ! -d "$project" ]; then echo "mode-b: not a directory: $project" >&2; exit 2; fi
+project=$(realpath "$project")
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+: "${MODE_B_MODEL:=ollama/gpt-oss:20b}"
+export PATH="$SCRIPT_DIR:$PATH"
+export OLLAMA_HOST=${OLLAMA_HOST:-127.0.0.1:11434}
+cd "$project"
+exec opencode run "$task" --agent orchestrator --model "$MODE_B_MODEL" --auto

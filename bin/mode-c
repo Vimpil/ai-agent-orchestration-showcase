@@ -1,0 +1,61 @@
+#!/bin/sh
+# Mode C - strict engineering workflow via local-llm-loop (plan -> execute -> review).
+#
+# Usage: mode-c <project-dir> <spec-file> [bootstrap args...]
+#   mode-c /path/to/repo spec.txt --plan-only
+#   mode-c /path/to/repo spec.txt --resume --max-steps 1
+#
+# Orchestration state (.bootstrap/) is stored OUTSIDE the repository under
+# <showcase-root>/runs/<project-slug>/<spec-slug>/ and linked into the project as
+# .bootstrap. Remove the link with:  unlink <project>/.bootstrap
+#
+# Requires the `bootstrap` binary (see orchestrator/) on PATH.
+set -eu
+if [ "$#" -lt 2 ]; then
+  echo 'usage: mode-c <project-dir> <spec-file> [bootstrap args...]' >&2
+  exit 2
+fi
+project=$1; spec=$2; shift 2
+if [ ! -d "$project" ]; then echo "mode-c: not a directory: $project" >&2; exit 2; fi
+if [ ! -f "$spec" ]; then echo "mode-c: spec file not found: $spec" >&2; exit 2; fi
+project=$(realpath "$project")
+spec=$(realpath "$spec")
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+
+slug=$(basename "$project" | sed 's/[^A-Za-z0-9._-]/-/g')
+specslug=$(basename "$spec" | sed 's/\.[^.]*$//' | sed 's/[^A-Za-z0-9._-]/-/g')
+base="$ROOT_DIR/runs/$slug/$specslug"
+mkdir -p "$base"
+
+resume=0
+for a in "$@"; do
+  if [ "$a" = "--resume" ]; then resume=1; fi
+done
+
+if [ "$resume" -eq 1 ]; then
+  if [ ! -L "$base/current" ] || [ ! -d "$base/current" ]; then
+    echo "mode-c: no previous run to resume under $base" >&2
+    exit 3
+  fi
+  run=$(readlink -f "$base/current")
+else
+  run="$base/run-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$run"
+  ln -sfn "$run" "$base/current"
+fi
+
+if [ -e "$project/.bootstrap" ] && [ ! -L "$project/.bootstrap" ]; then
+  echo "mode-c: warning: $project/.bootstrap is a real directory; state will stay inside the repo" >&2
+else
+  ln -sfn "$run" "$project/.bootstrap"
+fi
+
+: "${MODE_C_MODEL:=ollama/gpt-oss:20b}"
+export PATH="$SCRIPT_DIR:$PATH"
+export OPENCODE_AGENT=${OPENCODE_AGENT:-envelope}
+export OLLAMA_HOST=${OLLAMA_HOST:-127.0.0.1:11434}
+echo "mode-c: state dir  $run"
+echo "mode-c: project    $project"
+echo "mode-c: model      $MODE_C_MODEL"
+exec bootstrap orchestrate "$spec" --work-dir "$project" --model "$MODE_C_MODEL" "$@"

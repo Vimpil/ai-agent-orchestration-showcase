@@ -1,0 +1,110 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ollama/gpt-oss:20b",
+  "default_agent": "build",
+  "providers": {
+    "ollama": {
+      "settings": {
+        "baseURL": "http://127.0.0.1:11434/v1"
+      },
+      "models": {
+        "gpt-oss:20b": {
+          "limit": {
+            "context": 16384,
+            "input": 12288,
+            "output": 4096
+          }
+        },
+        "granite4:3b": {
+          "limit": {
+            "context": 16384,
+            "input": 12288,
+            "output": 4096
+          }
+        },
+        "qwen3:8b": {
+          "limit": {
+            "context": 16384,
+            "input": 12288,
+            "output": 4096
+          }
+        },
+        "qwen3:14b": {
+          "limit": {
+            "context": 16384,
+            "input": 12288,
+            "output": 4096
+          }
+        },
+        "devstral:24b": {
+          "limit": {
+            "context": 16384,
+            "input": 12288,
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+  "compaction": {
+    "auto": true,
+    "keep": {
+      "tokens": 2048
+    },
+    "buffer": 4096
+  },
+  "tool_output": {
+    "max_lines": 1500,
+    "max_bytes": 48000
+  },
+  "agent": {
+    "build": {
+      "permission": {
+        "execute": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "subagent": "deny"
+      }
+    },
+    "explore": { "permission": { "subagent": "deny", "edit": "deny" } },
+    "general": { "permission": { "subagent": "deny" } },
+    "plan": { "permission": { "edit": "deny" } },
+    "summary": { "permission": { "*": "deny" } },
+    "title": { "permission": { "*": "deny" } }
+  },
+  "permissions": [
+    { "action": "shell", "resource": "*", "effect": "ask" },
+    { "action": "shell", "resource": "git status *", "effect": "allow" },
+    { "action": "shell", "resource": "git diff *", "effect": "allow" },
+    { "action": "shell", "resource": "ls *", "effect": "allow" },
+    { "action": "shell", "resource": "cat *", "effect": "allow" },
+    { "action": "shell", "resource": "ollama list", "effect": "allow" },
+    { "action": "shell", "resource": "pwd", "effect": "allow" },
+    { "action": "shell", "resource": "git log *", "effect": "allow" },
+    { "action": "shell", "resource": "git show *", "effect": "allow" },
+    { "action": "shell", "resource": "git branch", "effect": "allow" },
+    { "action": "edit", "resource": "*", "effect": "ask" },
+    { "action": "write", "resource": "*", "effect": "ask" },
+    { "action": "patch", "resource": "*", "effect": "ask" },
+    { "action": "external_directory", "resource": "*", "effect": "ask" },
+    { "action": "subagent", "resource": "*", "effect": "ask" },
+    { "action": "skill", "resource": "*", "effect": "ask" },
+    { "action": "*", "resource": "*.env", "effect": "deny" },
+    { "action": "*", "resource": "*.env.*", "effect": "deny" },
+    { "action": "*", "resource": "*.env.example", "effect": "allow" },
+    { "action": "*", "resource": "*.ssh", "effect": "deny" },
+    { "action": "*", "resource": "*.ssh/*", "effect": "deny" },
+    { "action": "*", "resource": "*.pem", "effect": "deny" },
+    { "action": "*", "resource": "*.key", "effect": "deny" },
+    { "action": "shell", "resource": "git push*", "effect": "deny" },
+    { "action": "shell", "resource": "git reset*", "effect": "deny" },
+    { "action": "shell", "resource": "git clean*", "effect": "deny" },
+    { "action": "shell", "resource": "git restore*", "effect": "deny" },
+    { "action": "shell", "resource": "git stash*", "effect": "deny" },
+    { "action": "shell", "resource": "rm *", "effect": "deny" },
+    { "action": "shell", "resource": "sudo *", "effect": "deny" },
+    { "action": "webfetch", "resource": "*", "effect": "deny" },
+    { "action": "websearch", "resource": "*", "effect": "deny" },
+    { "action": "execute", "resource": "*", "effect": "deny" }
+  ]
+}

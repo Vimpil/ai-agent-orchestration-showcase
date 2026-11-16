@@ -1,0 +1,982 @@
+#!/usr/bin/env bash
+# autonomous - Bubblewrap isolated runner for OpenCode with --auto.
+#
+# Public adaptation of a private local-agent workspace entry point. The
+# original hardcoded host paths (workspace root, OpenCode binary, toolchain,
+# ripgrep cache) are replaced with values derived from this script's location
+# plus environment overrides. The sandbox logic is otherwise kept intact.
+# This adaptation has NOT been executed end-to-end; see
+# ../docs/security-boundaries.md for verified/unverified status and known
+# limitations.
+#
+# Usage: bin/autonomous <project-dir> "<task>" [--model <provider/model>] [--agent <name>] [--run-root <path>]
+# The wrapper keeps --auto always. Security comes from snapshot isolation + bwrap mounts + net ns,
+# not from permission prompts.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SANDBOX_CONFIG_DIR="${SANDBOX_CONFIG_DIR:-$ROOT_DIR/sandbox}"
+OPENCODE_BIN_HOST="${OPENCODE_BIN_HOST:-$(command -v opencode || true)}"
+TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-$ROOT_DIR/toolchain}"
+DEFAULT_MODEL="${DEFAULT_MODEL:-ollama/gpt-oss:20b}"
+DEFAULT_AGENT="${DEFAULT_AGENT:-build}"
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: autonomous <project-dir> \"<task>\" [--model X] [--agent Y] [--run-root PATH]" >&2
+  exit 2
+fi
+
+# Parse args: first two positional, rest options
+PROJECT_IN="$1"
+TASK="$2"
+shift 2
+MODEL="$DEFAULT_MODEL"
+AGENT="$DEFAULT_AGENT"
+RUN_ROOT_IN=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      [ "$#" -ge 2 ] || { echo "autonomous: --model requires a value" >&2; exit 2; }
+      MODEL="$2"; shift 2 ;;
+    --agent)
+      [ "$#" -ge 2 ] || { echo "autonomous: --agent requires a value" >&2; exit 2; }
+      AGENT="$2"; shift 2 ;;
+    --run-root)
+      [ "$#" -ge 2 ] || { echo "autonomous: --run-root requires a value" >&2; exit 2; }
+      RUN_ROOT_IN="$2"; shift 2 ;;
+    *)
+      echo "autonomous: unknown argument: $1" >&2
+      exit 2 ;;
+  esac
+done
+
+# --- Stage 6A: agent allowlist skeleton (deny-by-default, fail-closed) ---
+# Allowlist source: Phase 6 design §3.1.1 closed set. Anything else exits 2
+# before snapshot/bwrap. No fallback to a default agent on rejection.
+case "$AGENT" in
+  build|light|planner|executor|envelope|orchestrator|explorer|coder|verifier|researcher|reviewer) ;;
+  *)
+    echo "autonomous: refusing unknown or malformed agent: $AGENT" >&2
+    echo "autonomous: agent-rejected reason=not-in-allowlist agent=$AGENT" >&2
+    exit 2 ;;
+esac
+echo "autonomous: agent-allowlist allowed agent=$AGENT" >&2
+
+# --- F-06 canonical + component-aware path validation ---
+# Canonicalize textually first (handles relative, //, trailing /, ., ..) without requiring existence,
+# then deny-check, then existence check, then resolve symlinks and re-check (TOCTOU-resistant by
+# operating on the snapshot thereafter, not the original path).
+CANON_TXT="$(realpath -m "$PROJECT_IN" 2>/dev/null || echo "$PROJECT_IN")"
+is_denied() {
+  local p="$1" d
+  # Exact denies for / (prefix check would deny everything)
+  if [ "$p" = "/" ]; then return 0; fi
+  for d in /home /etc /proc /sys /dev /root /var /opt /usr; do
+    if [ "$p" = "$d" ]; then return 0; fi
+    # Component-aware prefix: p == d/...
+    case "$p" in
+      "$d"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+if is_denied "$CANON_TXT"; then
+  echo "autonomous: refusing to run with project=$CANON_TXT (host root or sensitive dir)" >&2
+  exit 2
+fi
+if [ ! -d "$PROJECT_IN" ]; then
+  echo "autonomous: not a directory: $PROJECT_IN" >&2
+  exit 2
+fi
+PROJECT="$(realpath "$PROJECT_IN")"
+if is_denied "$PROJECT"; then
+  echo "autonomous: refusing to run with project=$PROJECT (host root or sensitive dir)" >&2
+  exit 2
+fi
+
+# --- Stage 6A: PID-identity helpers (PID-reuse safe; PID alone never enough) ---
+# Every signal below requires /proc <pid>/stat field-22 starttime AND expected
+# cmdline (proxy script + socket). Malformed/incomplete metadata never kills.
+proc_starttime() {
+  # Field 22 starttime: suffix after last ")" begins at field 3, so [19] is field 22.
+  # rsplit handles comm containing spaces/parens (kernel terminator is final ")").
+  python3 -c 'import sys; data=open("/proc/%s/stat" % sys.argv[1]).read(); print(data.rsplit(")",1)[1].strip().split()[19])' "$1" 2>/dev/null
+  return 0
+}
+proc_cmdline_matches() {
+  # Exact NUL-separated token match (R6A-04): require argv tokens exactly equal
+  # to the expected script path and socket path. Substring/decoy matches are
+  # rejected. Empty cmdline (kernel threads) yields no tokens and is rejected.
+  # Full paths are required so a differently-located script does not match.
+  # Residual TOCTOU: this check and kill(2) are separate syscalls; PID reuse
+  # in the microseconds between them cannot be eliminated without
+  # pidfd_open/pidfd_send_signal (deferred). See terminate_proxy_verified().
+  python3 -c 'import sys; data=open("/proc/%s/cmdline" % sys.argv[1], "rb").read(); args=[a.decode("utf-8","surrogateescape") for a in data.split(b"\x00") if a != b""]; sys.exit(0 if (sys.argv[2] in args and sys.argv[3] in args) else 1)' "$1" "$2" "$3" 2>/dev/null
+  return $?
+}
+capture_starttime() {
+  local pid="$1" tries=0 cur=""
+  while [ "$tries" -lt 10 ]; do
+    cur="$(proc_starttime "$pid" 2>/dev/null || echo "")"
+    if [ -n "$cur" ]; then
+      printf '%s' "$cur"
+      return 0
+    fi
+    if [ ! -d "/proc/$pid" ]; then
+      break
+    fi
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  printf ''
+  return 0
+}
+# --- Stage 6A Part 4 helpers (R6A-01/R6A-02): fail-closed path validation ---
+# Shared helpers for canonical socket containment and lstat-based dir/file checks.
+# All use python lstat (never follows symlinks) so a symlink to a socket/dir
+# is rejected even though test -S/-d would follow it.
+safe_unlink_socket() {
+  # Args: $1=candidate sock (possibly file-supplied), $2=expected exact sock.
+  # Exit 0=unlinked, 2=absent (nothing to unlink), 1=refuse (do not unlink).
+  # Canonical exact match + lstat S_ISSOCK + uid match, then unlink in the same
+  # python process to shrink the check->unlink race. Residual race between
+  # lstat and unlink(2) cannot be eliminated with shell tools without
+  # dirfd/O_NOFOLLOW unlinkat; replacement in that microsecond window is
+  # confined to the single expected path (socket DoS only, not RCE).
+  local _sock="$1" _exp="$2"
+  if [ -z "$_sock" ] || [ -z "$_exp" ]; then
+    return 1
+  fi
+  python3 -c 'import os,stat,sys
+sock=sys.argv[1]; exp=sys.argv[2]
+try:
+    canon_sock=os.path.realpath(sock)
+    canon_exp=os.path.realpath(exp)
+except Exception:
+    sys.exit(1)
+if canon_sock != canon_exp:
+    sys.exit(1)
+try:
+    st=os.lstat(sock)
+except FileNotFoundError:
+    sys.exit(2)
+except (NotADirectoryError, OSError):
+    sys.exit(1)
+if stat.S_ISLNK(st.st_mode) or not stat.S_ISSOCK(st.st_mode):
+    sys.exit(1)
+try:
+    if st.st_uid != os.getuid():
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+try:
+    os.unlink(sock)
+except OSError:
+    sys.exit(1)
+sys.exit(0)' "$_sock" "$_exp" 2>/dev/null
+  return $?
+}
+validate_owned_real_dir() {
+  # Args: $1=path, $2=expected canonical path, $3=label for logs.
+  # Exit 0 iff $1 absent (fresh root, not yet created) OR is a real dir (not
+  # symlink), owned by invoking uid, canonically inside trusted parent.
+  # Exit 1 otherwise (refuse). Uses lstat so symlinks are rejected without
+  # following; canonical containment defeats ".." traversal that lstat alone
+  # would not see. Residual race validation->mkdir/bind remains (deferred).
+  local _p="$1" _exp="$2" _label="$3"
+  if [ ! -e "$_p" ] && [ ! -L "$_p" ]; then
+    return 0
+  fi
+  python3 -c 'import os,stat,sys
+p=sys.argv[1]; exp=sys.argv[2]
+try:
+    st=os.lstat(p)
+except FileNotFoundError:
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+    sys.exit(1)
+try:
+    if st.st_uid != os.getuid():
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+try:
+    if os.path.realpath(p) != os.path.realpath(exp):
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+sys.exit(0)' "$_p" "$_exp" 2>/dev/null
+  return $?
+}
+validate_owned_real_file() {
+  # Args: $1=path, $2=expected canonical path, $3=label.
+  # Exit 0 iff $1 absent OR is a real regular file, owned by invoking uid,
+  # canonically equal to expected. Used for EMPTY_FILE which is truncated via : >.
+  local _p="$1" _exp="$2" _label="$3"
+  if [ ! -e "$_p" ] && [ ! -L "$_p" ]; then
+    return 0
+  fi
+  python3 -c 'import os,stat,sys
+p=sys.argv[1]; exp=sys.argv[2]
+try:
+    st=os.lstat(p)
+except FileNotFoundError:
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    sys.exit(1)
+try:
+    if st.st_uid != os.getuid():
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+try:
+    if os.path.realpath(p) != os.path.realpath(exp):
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+sys.exit(0)' "$_p" "$_exp" 2>/dev/null
+  return $?
+}
+terminate_proxy_verified() {
+  local pid="$1" expected_start="$2" script="$3" sock="$4" role="$5"
+  # R6A-04: never signal without a valid recorded starttime. No cmdline-only fallback.
+  # Residual TOCTOU (documented): check->kill window cannot be closed without
+  # pidfd_open/pidfd_send_signal; bounded wait only while identity stays valid.
+  if [ -z "$pid" ]; then
+    echo "autonomous: proxy-cleanup role=$role pid-missing (skip)" >&2
+    return 0
+  fi
+  case "$pid" in
+    ''|*[!0-9]*)
+      echo "autonomous: proxy-cleanup role=$role pid-malformed pid=$pid (skip)" >&2
+      return 0 ;;
+  esac
+  case "$expected_start" in
+    ''|*[!0-9]*)
+      echo "autonomous: proxy-cleanup role=$role pid=$pid starttime-unavailable-or-malformed (do not kill)" >&2
+      return 0 ;;
+  esac
+  if [ ! -d "/proc/$pid" ]; then
+    echo "autonomous: proxy-cleanup role=$role pid=$pid dead" >&2
+    return 0
+  fi
+  local cur_start=""
+  cur_start="$(proc_starttime "$pid" 2>/dev/null || echo "")"
+  case "$cur_start" in
+    ''|*[!0-9]*)
+      echo "autonomous: proxy-cleanup role=$role pid=$pid starttime-unavailable (do not kill)" >&2
+      return 0 ;;
+  esac
+  if [ "$cur_start" != "$expected_start" ]; then
+    echo "autonomous: proxy-cleanup role=$role pid=$pid stale-pid-reuse starttime mismatch expected=$expected_start actual=$cur_start (do not kill)" >&2
+    return 0
+  fi
+  if ! proc_cmdline_matches "$pid" "$script" "$sock"; then
+    echo "autonomous: proxy-cleanup role=$role pid=$pid stale-pid-reuse cmdline mismatch (do not kill)" >&2
+    return 0
+  fi
+  echo "autonomous: proxy-cleanup role=$role pid=$pid verified sigterm" >&2
+  kill "$pid" 2>/dev/null || true
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if [ ! -d "/proc/$pid" ]; then
+      break
+    fi
+    local now_start=""
+    now_start="$(proc_starttime "$pid" 2>/dev/null || echo "")"
+    case "$now_start" in
+      ''|*[!0-9]*)
+        echo "autonomous: proxy-cleanup role=$role pid=$pid starttime-unavailable during wait (stop)" >&2
+        return 0 ;;
+    esac
+    if [ "$now_start" != "$expected_start" ]; then
+      echo "autonomous: proxy-cleanup role=$role pid=$pid reused during wait (stop)" >&2
+      return 0
+    fi
+    if ! proc_cmdline_matches "$pid" "$script" "$sock"; then
+      echo "autonomous: proxy-cleanup role=$role pid=$pid cmdline-mismatch during wait (stop)" >&2
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ -d "/proc/$pid" ]; then
+    local final_start=""
+    final_start="$(proc_starttime "$pid" 2>/dev/null || echo "")"
+    case "$final_start" in
+      ''|*[!0-9]*)
+        echo "autonomous: proxy-cleanup role=$role pid=$pid starttime-unavailable before sigkill (do not kill)" >&2
+        return 0 ;;
+    esac
+    if [ "$final_start" != "$expected_start" ]; then
+      echo "autonomous: proxy-cleanup role=$role pid=$pid stale-pid-reuse before sigkill (do not kill)" >&2
+      return 0
+    fi
+    if ! proc_cmdline_matches "$pid" "$script" "$sock"; then
+      echo "autonomous: proxy-cleanup role=$role pid=$pid stale-pid-reuse before sigkill (do not kill)" >&2
+      return 0
+    fi
+    echo "autonomous: proxy-cleanup role=$role pid=$pid verified sigkill after 2s" >&2
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 0.1
+  fi
+  return 0
+}
+sweep_proxies() {
+  local run_root="$1" state_dir="$2" run_id_val="$3"
+  local pidfile="$state_dir/proxy-pids.json"
+  local sweep_log="$state_dir/proxy-sweep.log"
+  # F-04: audit-log safety is separate from cleanup safety. sweep_log_safe is
+  # 1 only after the log validates and truncates safely; otherwise it stays 0
+  # and every audit append below is skipped (stderr remains the fallback
+  # diagnostic). Identity-validated cleanup still proceeds. The parent
+  # $state_dir check below stays fail-closed for both log and cleanup because
+  # the pidfile parent itself would be untrusted.
+  local sweep_log_safe=0
+  # R6A-02a: validate parent dir + sweep_log file before any truncation.
+  # Uses lstat (via validators) so pre-planted/dangling symlinks, non-regular
+  # files, and foreign-owned objects are refused without following them.
+  # Residual validate-to-use race remains (same-UID swap between lstat and
+  # open); the Python open below uses O_NOFOLLOW so a raced symlink fails
+  # closed instead of truncating its target. Parent $STATE is already
+  # validated by the caller immediately before this function (pre-proxy);
+  # re-validate here for defense in depth.
+  if ! validate_owned_real_dir "$state_dir" "$state_dir" "pre-sweep-state-dir"; then
+    echo "autonomous: proxy-sweep refuse state dir not owned real dir (no log write)" >&2
+    return 0
+  fi
+  if ! validate_owned_real_file "$sweep_log" "$sweep_log" "pre-sweep-log"; then
+    echo "autonomous: proxy-sweep refuse sweep-log not owned real file (cleanup continues, no log write)" >&2
+  else
+    # Safe truncation: Python O_NOFOLLOW (never follows symlink, incl. dangling).
+    # Absent -> exclusive create (O_CREAT|O_EXCL|O_NOFOLLOW); existing regular ->
+    # open O_NOFOLLOW + truncate. Any symlink/failure refuses without writing.
+    # F-04: only attempted when the log validated safe. On failure the log stays
+    # disabled (sweep_log_safe=0) but identity-validated cleanup continues.
+    if ! python3 -c 'import os,sys,stat; p=sys.argv[1]
+try:
+    st=os.lstat(p)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode): sys.exit(1)
+    fd=os.open(p, os.O_WRONLY|os.O_NOFOLLOW)
+except FileNotFoundError:
+    try:
+        fd=os.open(p, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o644)
+    except OSError:
+        sys.exit(1)
+except OSError:
+    sys.exit(1)
+try:
+    os.ftruncate(fd, 0)
+except OSError:
+    os.close(fd); sys.exit(1)
+os.close(fd)' "$sweep_log" 2>/dev/null; then
+      echo "autonomous: proxy-sweep refuse sweep-log safe-truncate failed (cleanup continues, no log write)" >&2
+    else
+      sweep_log_safe=1
+    fi
+  fi
+  if [ ! -f "$pidfile" ]; then
+    echo "autonomous: proxy-sweep none (no proxy-pids.json)" >&2
+    if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep none" >> "$sweep_log" 2>/dev/null || true; fi
+    return 0
+  fi
+  if [ -L "$pidfile" ]; then
+    echo "autonomous: proxy-sweep malformed: proxy-pids.json is symlink (refuse)" >&2
+    if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep malformed symlink refuse" >> "$sweep_log" 2>/dev/null || true; fi
+    return 0
+  fi
+  local pf_uid=""
+  pf_uid="$(stat -c %u "$pidfile" 2>/dev/null || echo "")"
+  if [ "$pf_uid" != "$(id -u)" ]; then
+    echo "autonomous: proxy-sweep malformed: proxy-pids.json not owned by invoking uid (refuse)" >&2
+    if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep malformed owner refuse" >> "$sweep_log" 2>/dev/null || true; fi
+    return 0
+  fi
+  local fsize=""
+  fsize="$(stat -c %s "$pidfile" 2>/dev/null || echo "0")"
+  case "$fsize" in
+    ''|*[!0-9]*)
+      echo "autonomous: proxy-sweep malformed: invalid size (refuse)" >&2
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep malformed size refuse" >> "$sweep_log" 2>/dev/null || true; fi
+      return 0 ;;
+  esac
+  if [ "$fsize" -gt 65536 ]; then
+    echo "autonomous: proxy-sweep malformed: file too large size=$fsize (refuse)" >&2
+    if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep malformed too-large refuse size=$fsize" >> "$sweep_log" 2>/dev/null || true; fi
+    return 0
+  fi
+  local parsed=""
+  parsed="$(python3 -c 'import sys,json; d=json.load(open(sys.argv[1])); assert isinstance(d,dict); print("\n".join(["%s\t%s\t%s\t%s\t%s" % (r, str(d[r].get("pid")) if isinstance(d[r].get("pid"),int) else "", str(d[r].get("starttime")) if isinstance(d[r].get("starttime"),int) else "", d[r].get("socket") if isinstance(d[r].get("socket"),str) else "", d[r].get("run_id") if isinstance(d[r].get("run_id"),str) else "") for r in ("ollama","git") if r in d]))' "$pidfile" 2>/dev/null)" || { echo "autonomous: proxy-sweep malformed proxy-pids.json (invalid JSON) refuse" >&2; if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep malformed invalid-json refuse" >> "$sweep_log" 2>/dev/null || true; fi; return 0; }
+  if [ -z "$parsed" ]; then
+    echo "autonomous: proxy-sweep none (no ollama/git entries)" >&2
+    if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep none entries" >> "$sweep_log" 2>/dev/null || true; fi
+    return 0
+  fi
+  while IFS=$'\t' read -r role pid st sock rid_entry; do
+    case "$pid" in
+      ''|*[!0-9]*)
+        echo "autonomous: proxy-sweep malformed pid role=$role pid=$pid (skip)" >&2
+        if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep malformed pid role=$role" >> "$sweep_log" 2>/dev/null || true; fi
+        continue ;;
+    esac
+    case "$st" in
+      ''|*[!0-9]*)
+        echo "autonomous: proxy-sweep malformed starttime role=$role pid=$pid (skip, do not kill)" >&2
+        if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep malformed starttime role=$role pid=$pid" >> "$sweep_log" 2>/dev/null || true; fi
+        continue ;;
+    esac
+    if [ -z "$sock" ]; then
+      echo "autonomous: proxy-sweep malformed socket role=$role pid=$pid (skip)" >&2
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep malformed socket role=$role pid=$pid" >> "$sweep_log" 2>/dev/null || true; fi
+      continue
+    fi
+    local expected_sock=""
+    local expected_script=""
+    if [ "$role" = "ollama" ]; then
+      expected_sock="$state_dir/ollama.sock"
+      expected_script="$SANDBOX_CONFIG_DIR/ollama-proxy-host.py"
+    elif [ "$role" = "git" ]; then
+      expected_sock="$state_dir/git.sock"
+      expected_script="$SANDBOX_CONFIG_DIR/git-proxy-host.py"
+    else
+      echo "autonomous: proxy-sweep refuse unknown role role=$role (skip)" >&2
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep refuse unknown-role role=$role" >> "$sweep_log" 2>/dev/null || true; fi
+      continue
+    fi
+    _canon_sock="$(realpath -m "$sock" 2>/dev/null || echo "")"
+    _canon_exp="$(realpath -m "$expected_sock" 2>/dev/null || echo "")"
+    if [ -z "$_canon_sock" ] || [ -z "$_canon_exp" ] || [ "$_canon_sock" != "$_canon_exp" ]; then
+      echo "autonomous: proxy-sweep refuse socket outside state role=$role socket=$sock expected=$expected_sock" >&2
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep refuse socket-outside-state role=$role socket=$sock expected=$expected_sock" >> "$sweep_log" 2>/dev/null || true; fi
+      continue
+    fi
+    if [ "$rid_entry" != "$run_id_val" ]; then
+      echo "autonomous: proxy-sweep ownership mismatch run_id role=$role (refuse)" >&2
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep ownership-mismatch run_id role=$role" >> "$sweep_log" 2>/dev/null || true; fi
+      continue
+    fi
+    if [ ! -d "/proc/$pid" ]; then
+      echo "autonomous: proxy-sweep dead role=$role pid=$pid" >&2
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep dead role=$role pid=$pid" >> "$sweep_log" 2>/dev/null || true; fi
+      _urc=0; safe_unlink_socket "$sock" "$expected_sock" || _urc=$?
+      if [ "$_urc" -eq 0 ]; then
+        if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep removed stale socket role=$role socket=$sock" >> "$sweep_log" 2>/dev/null || true; fi
+      elif [ "$_urc" -ne 2 ]; then
+        if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep refuse socket-unlink role=$role socket=$sock" >> "$sweep_log" 2>/dev/null || true; fi
+      fi
+      continue
+    fi
+    local cur_st=""
+    cur_st="$(proc_starttime "$pid" 2>/dev/null || echo "")"
+    if [ "$cur_st" != "$st" ]; then
+      echo "autonomous: proxy-sweep stale-pid-reuse role=$role pid=$pid starttime mismatch (do not kill)" >&2
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep stale-pid-reuse starttime role=$role pid=$pid" >> "$sweep_log" 2>/dev/null || true; fi
+      _urc=0; safe_unlink_socket "$sock" "$expected_sock" || _urc=$?
+      if [ "$_urc" -eq 0 ]; then
+        if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep removed stale socket role=$role socket=$sock" >> "$sweep_log" 2>/dev/null || true; fi
+      elif [ "$_urc" -ne 2 ]; then
+        if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep refuse socket-unlink role=$role socket=$sock" >> "$sweep_log" 2>/dev/null || true; fi
+      fi
+      continue
+    fi
+    if ! proc_cmdline_matches "$pid" "$expected_script" "$sock"; then
+      echo "autonomous: proxy-sweep stale-pid-reuse role=$role pid=$pid cmdline mismatch (do not kill)" >&2
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep stale-pid-reuse cmdline role=$role pid=$pid" >> "$sweep_log" 2>/dev/null || true; fi
+      _urc=0; safe_unlink_socket "$sock" "$expected_sock" || _urc=$?
+      if [ "$_urc" -eq 0 ]; then
+        if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep removed stale socket role=$role socket=$sock" >> "$sweep_log" 2>/dev/null || true; fi
+      elif [ "$_urc" -ne 2 ]; then
+        if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep refuse socket-unlink role=$role socket=$sock" >> "$sweep_log" 2>/dev/null || true; fi
+      fi
+      continue
+    fi
+    echo "autonomous: proxy-sweep verified leaked role=$role pid=$pid sigterm" >&2
+    if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep verified leaked role=$role pid=$pid sigterm" >> "$sweep_log" 2>/dev/null || true; fi
+    terminate_proxy_verified "$pid" "$st" "$expected_script" "$sock" "$role" || true
+    _urc=0; safe_unlink_socket "$sock" "$expected_sock" || _urc=$?
+    if [ "$_urc" -eq 0 ]; then
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep removed stale socket role=$role socket=$sock" >> "$sweep_log" 2>/dev/null || true; fi
+    elif [ "$_urc" -ne 2 ]; then
+      if [ "$sweep_log_safe" -eq 1 ]; then printf '%s\n' "proxy-sweep refuse socket-unlink role=$role socket=$sock" >> "$sweep_log" 2>/dev/null || true; fi
+    fi
+  done <<< "$parsed"
+  return 0
+}
+
+if [ ! -f "$SANDBOX_CONFIG_DIR/opencode.json" ]; then
+  echo "autonomous: sandbox config missing: $SANDBOX_CONFIG_DIR/opencode.json" >&2
+  exit 3
+fi
+if [ ! -x "$OPENCODE_BIN_HOST" ]; then
+  echo "autonomous: opencode binary not executable: $OPENCODE_BIN_HOST" >&2
+  exit 3
+fi
+if [ ! -d "$TOOLCHAIN_DIR" ]; then
+  echo "autonomous: toolchain dir missing: $TOOLCHAIN_DIR" >&2
+  exit 3
+fi
+if ! command -v bwrap >/dev/null 2>&1; then
+  echo "autonomous: bwrap not found" >&2
+  exit 3
+fi
+if ! command -v socat >/dev/null 2>&1; then
+  echo "autonomous: socat not found" >&2
+  exit 3
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "autonomous: python3 not found" >&2
+  exit 3
+fi
+for _helper in "$SANDBOX_CONFIG_DIR/snapshot.py" "$SANDBOX_CONFIG_DIR/git-proxy-host.py" "$SANDBOX_CONFIG_DIR/ollama-proxy-host.py" "$SANDBOX_CONFIG_DIR/git-client.py"; do
+  if [ ! -f "$_helper" ]; then
+    echo "autonomous: helper missing: $_helper" >&2
+    exit 3
+  fi
+done
+
+# --- Stage 6A: RUN_ROOT validation skeleton (host-controlled, fail-closed) ---
+# Approved parent for the Stage 6A skeleton: /tmp/opencode/. Retained runs
+# under runs/... (Modes B/C lifecycle) are Stage 6C; supplied paths outside
+# /tmp/opencode/ are refused here. No checkpoint/export lifecycle added.
+RUN_ROOT_MODE="ephemeral"
+if [ -n "$RUN_ROOT_IN" ]; then
+  RUN_ROOT_MODE="supplied"
+  CANON_RUN_ROOT="$(realpath -m "$RUN_ROOT_IN" 2>/dev/null || echo "")"
+  if [ -z "$CANON_RUN_ROOT" ]; then
+    echo "autonomous: refusing run_root (cannot canonicalize: $RUN_ROOT_IN)" >&2
+    exit 2
+  fi
+  case "$CANON_RUN_ROOT" in
+    /tmp/opencode/*) ;;
+    *)
+      echo "autonomous: refusing run_root outside approved parent /tmp/opencode/: $CANON_RUN_ROOT" >&2
+      exit 2 ;;
+  esac
+  _cur=""
+  _parts_str="$CANON_RUN_ROOT"
+  IFS='/' read -r -a _parts <<< "$_parts_str"
+  for _p in "${_parts[@]}"; do
+    [ -z "$_p" ] && continue
+    _cur="$_cur/$_p"
+    if [ -L "$_cur" ]; then
+      echo "autonomous: refusing run_root with symlink component: $_cur" >&2
+      exit 2
+    fi
+  done
+  RUN_ROOT="$CANON_RUN_ROOT"
+  if [ ! -d "$RUN_ROOT" ]; then
+    echo "autonomous: refusing run_root not a directory: $RUN_ROOT" >&2
+    exit 2
+  fi
+  _rm_mode="$(stat -c %a "$RUN_ROOT" 2>/dev/null || echo "")"
+  _rm_uid="$(stat -c %u "$RUN_ROOT" 2>/dev/null || echo "")"
+  if [ "$_rm_mode" != "700" ]; then
+    echo "autonomous: refusing run_root with mode $_rm_mode (required 700): $RUN_ROOT" >&2
+    exit 2
+  fi
+  if [ "$_rm_uid" != "$(id -u)" ]; then
+    echo "autonomous: refusing run_root not owned by invoking uid: $RUN_ROOT" >&2
+    exit 2
+  fi
+else
+  RUN_ROOT="$(mktemp -d /tmp/opencode/autonomous-XXXXXX)"
+  chmod 700 "$RUN_ROOT" 2>/dev/null || true
+  CANON_RUN_ROOT="$(realpath "$RUN_ROOT" 2>/dev/null || echo "$RUN_ROOT")"
+fi
+
+STATE="$RUN_ROOT/state"
+SNAPSHOT="$RUN_ROOT/snapshot"
+MANIFEST="$RUN_ROOT/snapshot-manifest.json"
+SNAP_LOG="$RUN_ROOT/snapshot.log"
+# Snapshot-of-snapshot refusal (design §3.8.1 skeleton).
+if [ "$PROJECT" = "/workspace" ] || [ "$PROJECT" = "/sandbox-state" ]; then
+  echo "autonomous: refusing project $PROJECT (sandbox mount)" >&2
+  exit 2
+fi
+if [ "$PROJECT" = "$RUN_ROOT" ] || [ "$PROJECT" = "$SNAPSHOT" ] || [ "$PROJECT" = "$STATE" ]; then
+  echo "autonomous: refusing project equal to run_root/snapshot/state: $PROJECT" >&2
+  exit 2
+fi
+case "$PROJECT" in
+  "$RUN_ROOT"/*|"$SNAPSHOT"/*|"$STATE"/*)
+    echo "autonomous: refusing project inside run_root: $PROJECT" >&2
+    exit 2 ;;
+esac
+case "$RUN_ROOT" in
+  "$PROJECT"/*)
+    echo "autonomous: refusing project containing run_root: project=$PROJECT run_root=$RUN_ROOT" >&2
+    exit 2 ;;
+esac
+
+# RUN_ID: host-written UUID in RUN_ROOT/run-id (skeleton, not full ledger).
+RUN_ID_FILE="$RUN_ROOT/run-id"
+RUN_ID=""
+if [ -f "$RUN_ID_FILE" ]; then
+  if [ -L "$RUN_ID_FILE" ]; then
+    echo "autonomous: refusing run_root with symlink run-id: $RUN_ID_FILE" >&2
+    exit 2
+  fi
+  RUN_ID="$(cat "$RUN_ID_FILE" 2>/dev/null | tr -d ' \t\r\n' || echo "")"
+  if ! printf '%s' "$RUN_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+    echo "autonomous: refusing run_root with malformed run-id" >&2
+    exit 2
+  fi
+  _rid_uid="$(stat -c %u "$RUN_ID_FILE" 2>/dev/null || echo "")"
+  if [ "$_rid_uid" != "$(id -u)" ]; then
+    echo "autonomous: refusing run_root run-id not owned by invoking uid" >&2
+    exit 2
+  fi
+else
+  RUN_ID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || echo "")"
+  RUN_ID="$(printf '%s' "$RUN_ID" | tr -d ' \t\r\n')"
+  if ! printf '%s' "$RUN_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+    echo "autonomous: failed to generate valid run-id" >&2
+    exit 3
+  fi
+  if [ -L "$RUN_ID_FILE" ]; then
+    echo "autonomous: refusing run_root with symlink run-id: $RUN_ID_FILE" >&2
+    exit 2
+  fi
+  printf '%s\n' "$RUN_ID" > "$RUN_ID_FILE"
+  chmod 644 "$RUN_ID_FILE" 2>/dev/null || true
+fi
+echo "autonomous: run_id=$RUN_ID run_root_mode=$RUN_ROOT_MODE" >&2
+
+# --- Stage 6A Part 4 (R6A-02): lstat validation before mkdir follows symlinks ---
+# Residual race validation->mkdir cannot be closed without O_NOFOLLOW dirfd (deferred).
+for _v in "$STATE" "$SNAPSHOT" "$RUN_ROOT/config" "$RUN_ROOT/empty-dir"; do
+  if ! validate_owned_real_dir "$_v" "$_v" "pre-mkdir"; then echo "autonomous: refusing run_root child (not owned real dir): $_v" >&2; exit 2; fi
+done
+for _v in "$STATE/data" "$STATE/state" "$STATE/cache" "$STATE/bin"; do
+  if ! validate_owned_real_dir "$_v" "$_v" "pre-mkdir-state-subdir"; then echo "autonomous: refusing state subdir (not owned real dir): $_v" >&2; exit 2; fi
+done
+if ! validate_owned_real_file "$RUN_ROOT/empty-file" "$RUN_ROOT/empty-file" "pre-mkdir-empty-file"; then echo "autonomous: refusing empty-file (not owned real file): $RUN_ROOT/empty-file" >&2; exit 2; fi
+
+mkdir -p "$STATE/data" "$STATE/state" "$STATE/cache" "$STATE/bin"
+mkdir -p "$SNAPSHOT"
+# Retained reuse only when a validated manifest exists (Stage 6A skeleton).
+# Otherwise this invocation creates a fresh snapshot inside the validated root.
+# R6A-02b: unconditional symlink check first. [ -f ] is false for dangling
+# symlinks, so the check inside the [ -f ] branch alone would miss them and
+# let snapshot.py write_text follow the link outside RUN_ROOT.
+if [ -L "$MANIFEST" ]; then
+  echo "autonomous: refusing run_root with symlink manifest: $MANIFEST" >&2
+  exit 2
+fi
+SKIP_SNAPSHOT_CREATE=0
+if [ "$RUN_ROOT_MODE" = "supplied" ] && [ -f "$MANIFEST" ]; then
+  if [ -L "$MANIFEST" ]; then
+    echo "autonomous: refusing retained run_root with symlink manifest: $MANIFEST" >&2
+    exit 2
+  fi
+  _man_uid="$(stat -c %u "$MANIFEST" 2>/dev/null || echo "")"
+  if [ "$_man_uid" != "$(id -u)" ]; then
+    echo "autonomous: refusing retained manifest not owned by invoking uid" >&2
+    exit 2
+  fi
+  _manifest_src="$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1])).get("src",""))' "$MANIFEST" 2>/dev/null || echo "")"
+  if [ -z "$_manifest_src" ]; then
+    echo "autonomous: refusing retained manifest without src" >&2
+    exit 2
+  fi
+  if [ "$_manifest_src" != "$PROJECT" ]; then
+    echo "autonomous: refusing retained snapshot project mismatch manifest_src=$_manifest_src project=$PROJECT" >&2
+    exit 2
+  fi
+  SKIP_SNAPSHOT_CREATE=1
+  echo "autonomous: retained snapshot detected, skipping snapshot.py create (Stage 6A skeleton reuse)" >&2
+fi
+if ! validate_owned_real_file "$SNAP_LOG" "$SNAP_LOG" "pre-snap-log"; then echo "autonomous: refusing snapshot log (not owned real file): $SNAP_LOG" >&2; exit 2; fi
+: > "$SNAP_LOG"
+# Copy rg binary for opencode glob/grep tools (host cache binary, not in /usr)
+RG_BIN="${RG_BIN:-${XDG_CACHE_HOME:-$HOME/.cache}/opencode/bin/rg}"
+if [ -f "$RG_BIN" ]; then
+  for _v in "$STATE/cache" "$STATE/cache/opencode" "$STATE/cache/opencode/bin"; do
+    if ! validate_owned_real_dir "$_v" "$_v" "pre-rg-copy"; then echo "autonomous: refusing rg dest (not owned real dir): $_v" >&2; exit 2; fi
+  done
+  mkdir -p "$STATE/cache/opencode/bin"
+  if ! validate_owned_real_file "$STATE/cache/opencode/bin/rg" "$STATE/cache/opencode/bin/rg" "pre-rg-file"; then echo "autonomous: refusing rg file (not owned real file): $STATE/cache/opencode/bin/rg" >&2; exit 2; fi
+  cp "$RG_BIN" "$STATE/cache/opencode/bin/rg"
+  chmod 755 "$STATE/cache/opencode/bin/rg"
+fi
+
+# --- F-03/F-04/F-07: build disposable snapshot (secrets/hardlinks/bare-hooks stripped) ---
+echo "autonomous: project=$PROJECT" >&2
+echo "autonomous: run_root=$RUN_ROOT" >&2
+echo "autonomous: snapshot=$SNAPSHOT" >&2
+for _v in "$STATE" "$SNAPSHOT"; do
+  if ! validate_owned_real_dir "$_v" "$_v" "pre-snapshot"; then echo "autonomous: refusing run_root child before snapshot (not owned real dir): $_v" >&2; exit 2; fi
+done
+# R6A-02b: validate MANIFEST destination (absent=fresh, else owned regular
+# file) before snapshot.py create writes it. Parent RUN_ROOT is already
+# validated (symlink-free, 700, invoking uid). snapshot.py also opens with
+# O_NOFOLLOW (see snapshot.py), so a raced symlink fails closed.
+if ! validate_owned_real_file "$MANIFEST" "$MANIFEST" "pre-snapshot-manifest"; then echo "autonomous: refusing manifest (not owned real file): $MANIFEST" >&2; exit 2; fi
+if [ "$SKIP_SNAPSHOT_CREATE" -eq 1 ]; then
+  echo "autonomous: retained snapshot reuse skip-create manifest=$MANIFEST" >&2
+else
+  if ! python3 "$SANDBOX_CONFIG_DIR/snapshot.py" create "$PROJECT" "$SNAPSHOT" "$MANIFEST" "$SNAP_LOG" 2>&1; then
+    echo "autonomous: snapshot creation failed (see $SNAP_LOG)" >&2
+    exit 4
+  fi
+fi
+# Count excluded for logging
+EXCLUDED_COUNT="$(python3 -c "import json; print(len(json.load(open('$MANIFEST')).get('excluded',[])))" 2>/dev/null || echo "?")"
+echo "autonomous: snapshot_excluded=$EXCLUDED_COUNT (secrets/hardlinks/bare)" >&2
+echo "autonomous: model=$MODEL agent=$AGENT (auto always)" >&2
+
+# npm shim for sandbox: node lives at /usr/bin/node, cli at /opt/toolchain
+NPM_CLI_REL="${NPM_CLI_REL:-npm/11.21.2/bin/npm-cli.js}"
+NPM_SHIM="$STATE/bin/npm"
+if ! validate_owned_real_file "$NPM_SHIM" "$NPM_SHIM" "pre-npm-shim"; then echo "autonomous: refusing npm shim (not owned real file): $NPM_SHIM" >&2; exit 2; fi
+cat > "$NPM_SHIM" <<EOS
+#!/bin/sh
+exec /usr/bin/node /opt/toolchain/${NPM_CLI_REL} "\$@"
+EOS
+chmod 755 "$NPM_SHIM"
+
+# --- F-05: host-side Ollama HTTP allowlist proxy (Unix socket -> 127.0.0.1:11434) ---
+# --- Stage 6A: proxy PID file + sweep (PID-reuse safe, bounded, deterministic) ---
+OLLAMA_SOCK="$STATE/ollama.sock"
+GIT_SOCK="$STATE/git.sock"
+OLLAMA_LOG="$STATE/ollama-proxy.log"
+GIT_LOG="$STATE/git-proxy.log"
+for _v in "$STATE" "$SNAPSHOT"; do
+  if ! validate_owned_real_dir "$_v" "$_v" "pre-proxy"; then echo "autonomous: refusing run_root child before proxy (not owned real dir): $_v" >&2; exit 2; fi
+done
+for _v in "$OLLAMA_LOG" "$GIT_LOG"; do
+  if ! validate_owned_real_file "$_v" "$_v" "pre-proxy-log"; then echo "autonomous: refusing proxy log (not owned real file): $_v" >&2; exit 2; fi
+done
+: > "$OLLAMA_LOG"
+: > "$GIT_LOG"
+# Sweep before spawn: only for the RUN_ROOT being entered. Ephemeral fresh
+# roots have no prior file (sweep logs none). Supplied retained roots clean
+# leaked proxies from a SIGKILLed prior invocation here.
+sweep_proxies "$RUN_ROOT" "$STATE" "$RUN_ID" || true
+_urc=0; safe_unlink_socket "$OLLAMA_SOCK" "$OLLAMA_SOCK" || _urc=$?
+if [ "$_urc" -eq 1 ]; then echo "autonomous: refusing stale ollama socket (not owned socket)" >&2; fi
+_urc=0; safe_unlink_socket "$GIT_SOCK" "$GIT_SOCK" || _urc=$?
+if [ "$_urc" -eq 1 ]; then echo "autonomous: refusing stale git socket (not owned socket)" >&2; fi
+python3 "$SANDBOX_CONFIG_DIR/ollama-proxy-host.py" "$OLLAMA_SOCK" "$OLLAMA_LOG" &
+HOST_OLLAMA_PID=$!
+python3 "$SANDBOX_CONFIG_DIR/git-proxy-host.py" "$GIT_SOCK" "$SNAPSHOT" "$GIT_LOG" &
+HOST_GIT_PID=$!
+HOST_OLLAMA_STARTTIME="$(capture_starttime "$HOST_OLLAMA_PID" 2>/dev/null || echo "")"
+HOST_GIT_STARTTIME="$(capture_starttime "$HOST_GIT_PID" 2>/dev/null || echo "")"
+if [ -z "$HOST_OLLAMA_STARTTIME" ]; then
+  echo "autonomous: proxy-pids warning: ollama starttime unavailable (will refuse to signal without starttime)" >&2
+fi
+if [ -z "$HOST_GIT_STARTTIME" ]; then
+  echo "autonomous: proxy-pids warning: git starttime unavailable (will refuse to signal without starttime)" >&2
+fi
+PROXY_PID_TMP="$STATE/proxy-pids.json.tmp.$$"
+if [ -L "$PROXY_PID_TMP" ]; then echo "autonomous: refusing proxy-pids tmp symlink: $PROXY_PID_TMP" >&2
+elif ! validate_owned_real_file "$PROXY_PID_TMP" "$PROXY_PID_TMP" "pre-proxy-pids-tmp"; then echo "autonomous: refusing proxy-pids tmp (not owned real file): $PROXY_PID_TMP" >&2
+else python3 -c 'import sys,json; pf,rid,osock,opid,ost,gsock,gpid,gst=sys.argv[1:9]; op=int(opid) if str(opid).isdigit() else None; osp=int(ost) if str(ost).isdigit() else None; gp=int(gpid) if str(gpid).isdigit() else None; gsp=int(gst) if str(gst).isdigit() else None; data={"ollama":{"pid":op,"starttime":osp,"socket":osock,"run_id":rid},"git":{"pid":gp,"starttime":gsp,"socket":gsock,"run_id":rid}}; open(pf,"w").write(json.dumps(data,sort_keys=True)+"\n")' "$PROXY_PID_TMP" "$RUN_ID" "$OLLAMA_SOCK" "$HOST_OLLAMA_PID" "$HOST_OLLAMA_STARTTIME" "$GIT_SOCK" "$HOST_GIT_PID" "$HOST_GIT_STARTTIME" 2>/dev/null || true; fi
+if [ -f "$PROXY_PID_TMP" ]; then
+  mv "$PROXY_PID_TMP" "$STATE/proxy-pids.json"
+  chmod 644 "$STATE/proxy-pids.json" 2>/dev/null || true
+  echo "autonomous: proxy-pids recorded ollama_pid=$HOST_OLLAMA_PID starttime=$HOST_OLLAMA_STARTTIME git_pid=$HOST_GIT_PID starttime=$HOST_GIT_STARTTIME run_id=$RUN_ID" >&2
+fi
+
+cleanup() {
+  terminate_proxy_verified "$HOST_OLLAMA_PID" "$HOST_OLLAMA_STARTTIME" "$SANDBOX_CONFIG_DIR/ollama-proxy-host.py" "$OLLAMA_SOCK" "ollama" || true
+  terminate_proxy_verified "$HOST_GIT_PID" "$HOST_GIT_STARTTIME" "$SANDBOX_CONFIG_DIR/git-proxy-host.py" "$GIT_SOCK" "git" || true
+  wait "$HOST_OLLAMA_PID" 2>/dev/null || true
+  wait "$HOST_GIT_PID" 2>/dev/null || true
+  # Owned socket cleanup only: exact canonical match + lstat S_ISSOCK + uid (R6A-01).
+  safe_unlink_socket "$OLLAMA_SOCK" "$OLLAMA_SOCK" || true
+  safe_unlink_socket "$GIT_SOCK" "$GIT_SOCK" || true
+}
+trap cleanup EXIT
+for _ in $(seq 1 30); do
+  if [ -S "$OLLAMA_SOCK" ]; then break; fi
+  sleep 0.1
+done
+if [ ! -S "$OLLAMA_SOCK" ]; then
+  echo "autonomous: failed to create host ollama socket" >&2
+  exit 4
+fi
+chmod 777 "$OLLAMA_SOCK" 2>/dev/null || true
+for _ in $(seq 1 30); do
+  if [ -S "$GIT_SOCK" ]; then break; fi
+  sleep 0.1
+done
+if [ ! -S "$GIT_SOCK" ]; then
+  echo "autonomous: failed to create host git socket" >&2
+  exit 4
+fi
+chmod 777 "$GIT_SOCK" 2>/dev/null || true
+# Empty dir/file for hiding git-core/git-shell inside (R6A-02: validate before follow)
+EMPTY_DIR="$RUN_ROOT/empty-dir"
+if ! validate_owned_real_dir "$EMPTY_DIR" "$EMPTY_DIR" "pre-empty-dir"; then echo "autonomous: refusing empty-dir (not owned real dir): $EMPTY_DIR" >&2; exit 2; fi
+mkdir -p "$EMPTY_DIR"
+EMPTY_FILE="$RUN_ROOT/empty-file"
+if ! validate_owned_real_file "$EMPTY_FILE" "$EMPTY_FILE" "pre-empty-file"; then echo "autonomous: refusing empty-file (not owned real file): $EMPTY_FILE" >&2; exit 2; fi
+: > "$EMPTY_FILE"
+chmod 644 "$EMPTY_FILE"
+
+# --- Stage 6A Part 4 (R6A-02): revalidate binds immediately before use ---
+for _v in "$STATE" "$SNAPSHOT"; do
+  if ! validate_owned_real_dir "$_v" "$_v" "pre-bwrap"; then echo "autonomous: refusing run_root child before bwrap (not owned real dir): $_v" >&2; exit 2; fi
+done
+if ! validate_owned_real_file "$EMPTY_FILE" "$EMPTY_FILE" "pre-bwrap-empty-file"; then echo "autonomous: refusing empty-file before bwrap (not owned real file): $EMPTY_FILE" >&2; exit 2; fi
+if ! validate_owned_real_dir "$EMPTY_DIR" "$EMPTY_DIR" "pre-bwrap-empty-dir"; then echo "autonomous: refusing empty-dir before bwrap (not owned real dir): $EMPTY_DIR" >&2; exit 2; fi
+
+# Build bwrap args. NOTE: order matters. Minimal /etc via tmpfs + selective ro-binds.
+# /workspace is the SNAPSHOT bind (not host project). /sandbox-state is rw per-run state.
+# Config is ro-bind. System dirs are ro-bind. Network is fully isolated (--unshare-all).
+# F-01/F-02: NO real git inside. /usr/bin/git + /bin/git are read-only client shims to host proxy.
+declare -a BWRAP_ARGS=(
+  --unshare-all
+  --unshare-user
+  --die-with-parent
+  --disable-userns
+  --assert-userns-disabled
+  --uid 1000 --gid 1000
+  --clearenv
+  --setenv HOME /sandbox-home
+  --setenv PATH /sandbox-state/bin:/opt/opencode/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+  --setenv OLLAMA_HOST 127.0.0.1:11434
+  --setenv XDG_CONFIG_HOME /sandbox-home/.config
+  --setenv XDG_DATA_HOME /sandbox-state/data
+  --setenv XDG_STATE_HOME /sandbox-state/state
+  --setenv XDG_CACHE_HOME /sandbox-state/cache
+  --setenv TMPDIR /tmp
+  --setenv LANG en_US.UTF-8
+  --setenv TERM xterm
+  --setenv GIT_CONFIG_NOSYSTEM 1
+  --setenv GIT_CONFIG_GLOBAL /dev/null
+  --setenv GIT_CONFIG_SYSTEM /dev/null
+  --setenv GIT_TERMINAL_PROMPT 0
+  --setenv GIT_SSH_COMMAND false
+  --setenv SSH_ASKPASS /bin/false
+  --setenv GIT_ASKPASS /bin/false
+  --setenv GIT_PAGER cat
+  --setenv PAGER cat
+  --setenv npm_config_cache /sandbox-state/npm-cache
+  --setenv COMPOSER_HOME /sandbox-state/composer
+)
+
+# System runtime (ro-bind /usr, symlinked /lib etc.)
+BWRAP_ARGS+=(--ro-bind /usr /usr)
+# Minimal /etc: tmpfs base, then selective ro-binds. /etc/hostname intentionally absent.
+BWRAP_ARGS+=(--tmpfs /etc)
+BWRAP_ARGS+=(--ro-bind /etc/ssl /etc/ssl)
+BWRAP_ARGS+=(--ro-bind /etc/alternatives /etc/alternatives)
+BWRAP_ARGS+=(--ro-bind /etc/localtime /etc/localtime)
+BWRAP_ARGS+=(--ro-bind /etc/passwd /etc/passwd)
+BWRAP_ARGS+=(--ro-bind /etc/group /etc/group)
+BWRAP_ARGS+=(--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf)
+BWRAP_ARGS+=(--ro-bind /etc/hosts /etc/hosts)
+BWRAP_ARGS+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
+BWRAP_ARGS+=(--ro-bind /etc/ld.so.cache /etc/ld.so.cache)
+BWRAP_ARGS+=(--ro-bind /etc/ld.so.conf /etc/ld.so.conf)
+BWRAP_ARGS+=(--ro-bind /etc/ld.so.conf.d /etc/ld.so.conf.d)
+BWRAP_ARGS+=(--ro-bind /lib /lib)
+BWRAP_ARGS+=(--ro-bind /lib64 /lib64)
+BWRAP_ARGS+=(--ro-bind /bin /bin)
+BWRAP_ARGS+=(--ro-bind /sbin /sbin)
+BWRAP_ARGS+=(--proc /proc)
+BWRAP_ARGS+=(--dev /dev)
+BWRAP_ARGS+=(--tmpfs /tmp)
+BWRAP_ARGS+=(--tmpfs /run)
+
+# F-01/F-02: client-only git (no real binary inside). Hide helpers that could be invoked directly.
+BWRAP_ARGS+=(--dir /opt)
+BWRAP_ARGS+=(--ro-bind "$SANDBOX_CONFIG_DIR/git-client.py" /usr/bin/git)
+BWRAP_ARGS+=(--ro-bind "$SANDBOX_CONFIG_DIR/git-client.py" /bin/git)
+BWRAP_ARGS+=(--tmpfs /usr/lib/git-core)
+BWRAP_ARGS+=(--tmpfs /lib/git-core)
+BWRAP_ARGS+=(--ro-bind "$EMPTY_FILE" /usr/bin/git-shell)
+
+# Opencode binary: /opt/opencode/bin/opencode (file bind)
+BWRAP_ARGS+=(--dir /opt/opencode)
+BWRAP_ARGS+=(--dir /opt/opencode/bin)
+BWRAP_ARGS+=(--ro-bind "$OPENCODE_BIN_HOST" /opt/opencode/bin/opencode)
+
+# Toolchain (npm cli) read-only
+BWRAP_ARGS+=(--ro-bind "$TOOLCHAIN_DIR" /opt/toolchain)
+
+# State (rw) and workspace SNAPSHOT (rw) — snapshot, not host project
+BWRAP_ARGS+=(--bind "$STATE" /sandbox-state)
+BWRAP_ARGS+=(--bind "$SNAPSHOT" /workspace)
+
+# Sandbox home tmpfs + config: per-run writable copy with opencode.json ro-overlay
+# (opencode needs to write service.json inside config dir, but config file itself must stay ro)
+CONFIG_RUN="$RUN_ROOT/config"
+if ! validate_owned_real_dir "$CONFIG_RUN" "$CONFIG_RUN" "pre-config"; then echo "autonomous: refusing config dir (not owned real dir): $CONFIG_RUN" >&2; exit 2; fi
+mkdir -p "$CONFIG_RUN"
+if ! validate_owned_real_dir "$CONFIG_RUN" "$CONFIG_RUN" "post-mkdir-config"; then echo "autonomous: refusing config dir after mkdir (not owned real dir): $CONFIG_RUN" >&2; exit 2; fi
+if ! validate_owned_real_file "$CONFIG_RUN/opencode.json" "$CONFIG_RUN/opencode.json" "pre-config-copy"; then echo "autonomous: refusing config file (not owned real file): $CONFIG_RUN/opencode.json" >&2; exit 2; fi
+cp "$SANDBOX_CONFIG_DIR/opencode.json" "$CONFIG_RUN/opencode.json"
+chmod 644 "$CONFIG_RUN/opencode.json"
+# Copy any agents files if present (currently none, forward-compatible)
+if [ -d "$SANDBOX_CONFIG_DIR/agents" ]; then
+  if ! validate_owned_real_dir "$CONFIG_RUN/agents" "$CONFIG_RUN/agents" "pre-agents"; then echo "autonomous: refusing config agents (not owned real dir): $CONFIG_RUN/agents" >&2; exit 2; fi
+  mkdir -p "$CONFIG_RUN/agents"
+  cp -a "$SANDBOX_CONFIG_DIR/agents/." "$CONFIG_RUN/agents/" 2>/dev/null || true
+fi
+if ! validate_owned_real_dir "$CONFIG_RUN" "$CONFIG_RUN" "pre-bwrap-config"; then echo "autonomous: refusing config dir before bwrap (not owned real dir): $CONFIG_RUN" >&2; exit 2; fi
+if ! validate_owned_real_file "$CONFIG_RUN/opencode.json" "$CONFIG_RUN/opencode.json" "pre-bwrap-config-file"; then echo "autonomous: refusing config file before bwrap (not owned real file): $CONFIG_RUN/opencode.json" >&2; exit 2; fi
+BWRAP_ARGS+=(--tmpfs /sandbox-home)
+BWRAP_ARGS+=(--dir /sandbox-home/.config)
+BWRAP_ARGS+=(--bind "$CONFIG_RUN" /sandbox-home/.config/opencode)
+BWRAP_ARGS+=(--ro-bind "$CONFIG_RUN/opencode.json" /sandbox-home/.config/opencode/opencode.json)
+
+BWRAP_ARGS+=(--chdir /workspace)
+
+# Inner bootstrap: start TCP->Unix forwarder (to HTTP allowlist proxy), wait, then run opencode --auto
+# Args to dash -c: $0=dummy, $1=AGENT, $2=MODEL, $3=TASK
+INNER_SCRIPT='
+socat TCP-LISTEN:11434,fork,reuseaddr UNIX-CONNECT:/sandbox-state/ollama.sock &
+PROXY_PID=$!
+# Wait for proxy + Ollama to answer (via allowlisted discovery endpoint)
+for _i in $(seq 1 50); do
+  if curl -s -m 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
+# Final check with explicit curl output on failure
+if ! curl -s -m 5 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+  echo "sandbox: ollama proxy unavailable" >&2
+  kill "$PROXY_PID" 2>/dev/null || true
+  exit 5
+fi
+# Warmup: cold-cache opencode run fails with Unsupported package; debug/models initializes provider cache/service
+opencode debug paths >/dev/null 2>&1 || true
+opencode debug config >/dev/null 2>&1 || true
+opencode debug agents >/dev/null 2>&1 || true
+opencode models >/dev/null 2>&1 || true
+opencode run --auto --agent "$1" --model "$2" "$3"
+RC=$?
+kill "$PROXY_PID" 2>/dev/null || true
+exit $RC
+'
+
+# Run bwrap (do NOT exec, so trap cleanup for host proxies runs)
+set +e
+bwrap "${BWRAP_ARGS[@]}" -- /usr/bin/dash -c "$INNER_SCRIPT" dummy "$AGENT" "$MODEL" "$TASK"
+RC=$?
+set -e
+cleanup
+trap - EXIT
+
+echo "autonomous: exit=$RC run_root=$RUN_ROOT" >&2
+
+# --- F-03/F-04/F-07: controlled export back (working tree only, no .git/hooks, conflict-safe) ---
+EXPORT_LOG="$RUN_ROOT/export.log"
+# R6A-02b: manifest must be an owned regular file before snapshot.py export
+# reads it; a swapped symlink must not redirect the read outside RUN_ROOT.
+if ! validate_owned_real_file "$MANIFEST" "$MANIFEST" "pre-export-manifest"; then echo "autonomous: refusing manifest before export (not owned real file): $MANIFEST" >&2; exit 2; fi
+if ! validate_owned_real_file "$EXPORT_LOG" "$EXPORT_LOG" "pre-export-log"; then echo "autonomous: refusing export log (not owned real file): $EXPORT_LOG" >&2; exit 2; fi
+: > "$EXPORT_LOG"
+if ! python3 "$SANDBOX_CONFIG_DIR/snapshot.py" export "$SNAPSHOT" "$PROJECT" "$MANIFEST" "$EXPORT_LOG" 2>&1; then
+  echo "autonomous: export finished with warnings (see $EXPORT_LOG)" >&2
+fi
+cat "$EXPORT_LOG" >&2 || true
+exit "$RC"

@@ -1,0 +1,184 @@
+#!/bin/sh
+# Mode A - lightweight single-model agent (file inspection, search, small edits).
+# Usage: mode-a <project-dir> "<task>"
+#
+# TRANSITIONAL host-execution path: invokes OpenCode directly on the host with
+# --auto. It is NOT the sandboxed autonomous path; see bin/autonomous.
+# MODE_A_MODEL is an environment-specific example default; override it.
+#
+# Mode A uses the restricted 'light' agent bundled with this showcase
+# (agents/light.md). That agent is a permission denylist, not an isolation
+# boundary: it denies delegation, the execute tool, sudo and other
+# privilege-escalation commands, external directories, common secret-file
+# patterns, and mutating git commands, and asks (auto-approved under --auto)
+# for other shell commands. It allows ordinary reads, edits and cheap tests.
+# It runs on the host; permission patterns are text-based and do not prevent
+# all host access. Effective permissions are inspectable in agents/light.md
+# and via `opencode debug agents`.
+# --auto auto-approves permissions that are not explicitly denied; explicit
+# deny rules remain enforced.
+#
+# MODE_A_AGENT is retained as an override for compatibility, but overriding it
+# may change the permission posture: an agent with broader permissions combined
+# with --auto can be auto-approved into broader host access. Only override it
+# with an agent whose restrictions you have inspected.
+set -eu
+if [ "$#" -lt 2 ]; then
+  echo 'usage: mode-a <project-dir> "<task>"' >&2
+  exit 2
+fi
+project=$1; task=$2
+if [ ! -d "$project" ]; then echo "mode-a: not a directory: $project" >&2; exit 2; fi
+project=$(realpath "$project")
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+: "${MODE_A_MODEL:=ollama/granite4:3b}"
+: "${MODE_A_AGENT:=light}"
+export PATH="$SCRIPT_DIR:$PATH"
+export OLLAMA_HOST=${OLLAMA_HOST:-127.0.0.1:11434}
+
+# Resolve and validate the selected agent in the same project context in which
+# `opencode run` will execute. Agent resolution depends on global and
+# project-level configuration, so this must happen after changing directory.
+cd "$project"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo 'mode-a: python3 is required to validate the OpenCode agent configuration.' >&2
+  exit 3
+fi
+
+# Fail closed if the selected agent is unavailable or, for the bundled
+# restricted `light` agent, does not resolve with the expected critical
+# permissions. Existence alone is not a security claim; it only confirms that
+# OpenCode can resolve an agent with this id in this project context.
+if ! python3 - "$MODE_A_AGENT" <<'PY'
+import fnmatch
+import json
+import subprocess
+import sys
+
+agent_id = sys.argv[1]
+
+try:
+    proc = subprocess.run(
+        ["opencode", "debug", "agents"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+except FileNotFoundError:
+    print("mode-a: opencode CLI not found", file=sys.stderr)
+    sys.exit(1)
+
+if proc.returncode != 0:
+    detail = (proc.stderr or proc.stdout or "").strip()
+    print("mode-a: `opencode debug agents` failed: " + detail, file=sys.stderr)
+    sys.exit(1)
+
+try:
+    agents = json.loads(proc.stdout)
+except (json.JSONDecodeError, ValueError) as exc:
+    print("mode-a: could not parse `opencode debug agents` output: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(agents, list):
+    print("mode-a: unexpected `opencode debug agents` output shape", file=sys.stderr)
+    sys.exit(1)
+
+agent = next((a for a in agents if isinstance(a, dict) and a.get("id") == agent_id), None)
+if agent is None:
+    print('mode-a: agent "{}" is not available in this OpenCode configuration.'.format(agent_id), file=sys.stderr)
+    print('mode-a: install agents/{}.md to ~/.config/opencode/agents/{}.md or <project>/.opencode/agents/{}.md,'.format(agent_id, agent_id, agent_id), file=sys.stderr)
+    print("mode-a: or set MODE_A_AGENT to an available, inspected agent.", file=sys.stderr)
+    sys.exit(1)
+
+# For non-bundled agents we cannot assert a permission posture; warn instead.
+if agent_id != "light":
+    print('mode-a: warning: agent "{}" is not the bundled restricted `light` agent;'.format(agent_id), file=sys.stderr)
+    print("mode-a: its permission posture was not validated. Only use agents whose", file=sys.stderr)
+    print("mode-a: restrictions you have inspected.", file=sys.stderr)
+    sys.exit(0)
+
+perms = agent.get("permissions")
+if not isinstance(perms, list):
+    print('mode-a: restricted agent "light" resolved but has no permissions list.', file=sys.stderr)
+    sys.exit(1)
+
+
+def matches(action_pattern, resource_pattern, action, resource):
+    if not isinstance(action_pattern, str) or not isinstance(resource_pattern, str):
+        return False
+    if not isinstance(action, str) or not isinstance(resource, str):
+        return False
+    if action_pattern not in ("*", action):
+        return False
+    try:
+        return fnmatch.fnmatchcase(resource, resource_pattern)
+    except (TypeError, ValueError):
+        return False
+
+def effective(action, resource):
+    result = None
+    for entry in perms:
+        if not isinstance(entry, dict):
+            continue
+        if matches(entry.get("action", ""), entry.get("resource", ""), action, resource):
+            result = entry.get("effect")
+    return result
+
+
+errors = []
+
+if effective("shell", "zzz-mode-a-validation-sentinel") != "ask":
+    errors.append(
+        "shell default is {!r}, expected \"ask\"".format(
+            effective("shell", "zzz-mode-a-validation-sentinel")
+        )
+    )
+
+for command in ("rm -rf /", "sudo id", "git push origin main", "chmod 777 file", "dd if=/dev/zero of=/dev/sda"):
+    if effective("shell", command) != "deny":
+        errors.append(
+            "dangerous command is not denied: {!r} -> {!r}".format(
+                command, effective("shell", command)
+            )
+        )
+
+for path in (".env", "id_rsa", "server.pem", "private.key"):
+    for action in ("read", "edit"):
+        if effective(action, path) != "deny":
+            errors.append(
+                "secret file is not denied: {} {} -> {!r}".format(
+                    action, path, effective(action, path)
+                )
+            )
+
+if effective("external_directory", "zzz-mode-a-validation-sentinel") != "deny":
+    errors.append(
+        "external_directory is {!r}, expected \"deny\"".format(
+            effective("external_directory", "zzz-mode-a-validation-sentinel")
+        )
+    )
+
+for action in ("webfetch", "websearch"):
+    if effective(action, "https://example.invalid/") != "deny":
+        errors.append(
+            "{} is {!r}, expected \"deny\"".format(
+                action, effective(action, "https://example.invalid/")
+            )
+        )
+
+if errors:
+    print('mode-a: restricted agent "light" resolved, but its critical permissions are not as expected:', file=sys.stderr)
+    for error in errors:
+        print("mode-a:   - " + error, file=sys.stderr)
+    print("mode-a: refusing to run; inspect `opencode debug agents` in this project or repair the agent/config.", file=sys.stderr)
+    sys.exit(1)
+
+print('mode-a: validated restricted agent "light" in project context (availability + critical permissions).', file=sys.stderr)
+sys.exit(0)
+PY
+then
+  exit 3
+fi
+
+exec opencode run "$task" --agent "$MODE_A_AGENT" --model "$MODE_A_MODEL" --auto
