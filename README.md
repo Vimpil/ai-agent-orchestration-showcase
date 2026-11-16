@@ -255,9 +255,12 @@ call, and any live model-dependent step is marked as optional or unavailable.
 
 ## Publication status
 
-This is a publication-preparation subset. Every included file is accounted for
-in [PUBLICATION_MANIFEST.md](PUBLICATION_MANIFEST.md), including its source,
-adaptation and verification status. Read that file before publishing.
+This repository is published as a public engineering portfolio showcase. Every
+included file is accounted for in
+[PUBLICATION_MANIFEST.md](PUBLICATION_MANIFEST.md), including its source,
+adaptation and verification status.
 
-The final verdict, blockers, warnings and next steps are in
-[RELEASE_READINESS.md](RELEASE_READINESS.md).
+Licensing and release-readiness information is in
+[LICENSING.md](LICENSING.md), [LICENSE_PENDING.md](LICENSE_PENDING.md), and
+[RELEASE_READINESS.md](RELEASE_READINESS.md). The repository has no general
+project-wide license; see `LICENSING.md`.

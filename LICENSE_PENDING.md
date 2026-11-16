@@ -11,6 +11,10 @@ Permission-Controlled Commercial Use**. That policy is a specification and
 decision record, not an operative license. It has not been implemented as
 license text, and it does not grant reuse rights by itself.
 
+The owner has confirmed authorship and the right to publish the Class P
+showcase files and adaptations in this portfolio. That confirmation covers
+publication only; it does not grant additional reuse rights.
+
 ## Component licenses
 
 | Component | License | Notice |

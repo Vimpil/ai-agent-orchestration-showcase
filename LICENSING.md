@@ -31,6 +31,15 @@ Summary of the approved direction (see the owner decision record for full text):
 - Upstream third-party licenses (including MIT) remain in force and are not
   narrowed by the custom policy.
 
+## Publication and reuse distinction
+
+The owner has confirmed authorship and the right to publish the Class P
+showcase files and adaptations in this portfolio. Publication of this
+repository does not grant additional reuse rights to original
+showcase-specific components. Publishing a file as portfolio material is
+distinct from licensing it for reuse, modification, redistribution, or
+commercial exploitation.
+
 ## Component-level status
 
 | Component | License / status |

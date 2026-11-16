@@ -164,7 +164,7 @@ The showcase contains **55 publishable files**: every regular file under the sho
 - The sandbox restricts reachability, not correctness of the agent's work.
 - See `docs/security-boundaries.md` for the full list.
 
-## Manual review required before publication
+## Notes for manual review
 
 1. **Licensing status** — see `LICENSING.md` and `LICENSE_PENDING.md`. A
    licensing policy has been approved in principle (Portfolio-Friendly

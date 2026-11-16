@@ -354,7 +354,8 @@ unverified component was executed.
 **Interviewer should observe**
 
 - Upstream-derived components and their licenses are identified.
-- Showcase-specific components are unlicensed and pending a license decision.
+- Showcase-specific components carry no reuse license for this release; a custom
+  license may be considered in a future release.
 - The manifest records verification status for each file.
 
 **Demonstrates**

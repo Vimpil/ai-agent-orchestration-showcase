@@ -2,12 +2,13 @@
 
 ## Final verdict
 
-**READY FOR MANUAL REVIEW — DOCUMENTED LIMITATIONS**
+**PUBLISHED — DOCUMENTED LIMITATIONS**
 
-This is a small, honest, experimental portfolio project. The disclosure,
-provenance, and verification-evidence issues found in this pass were corrected
-or documented. It is not production-ready and must not be described as a
-verified security boundary.
+This is a small, honest, experimental portfolio project. The initial public
+release has been published to GitHub. The disclosure, provenance, and
+verification-evidence issues found in preparation were corrected or documented.
+It is not production-ready and must not be described as a verified security
+boundary.
 
 ## BLOCKERS
 
@@ -50,9 +51,9 @@ Completed cleanup); no build artifacts remain now.
 - Removed the empty, unused `licenses/` directory.
 - Added this `RELEASE_READINESS.md`.
 - Updated the manifest file inventory to account for `RELEASE_READINESS.md`
-  (61 tracked files).
-- Verified JSON validity of all eight recorded workflow artifacts and
-  `sandbox/opencode.json`.
+  (55 tracked files in the published release).
+- Verified JSON validity of `sandbox/opencode.json`. The eight recorded workflow
+  artifacts were excluded from this release (Class X1) and are not present.
 - Verified relative Markdown links resolve.
 - Removed `orchestrator/target/` (generated Rust build artifacts and build
   metadata, ~188 MB) during the final hygiene check. Confirmed no other build
@@ -92,17 +93,17 @@ been confirmed yet. Recorded workflow artifacts (`recorded-run/*.json`) are
 excluded from all redistributed copies until ownership and applicable rights
 are verified. See `LICENSING.md` and `LICENSE_PENDING.md`.
 
-## Exact next steps before publication
+## Post-publication notes
 
-1. Complete the remaining user decisions above.
-2. Obtain qualified legal review of any final custom license text before
-   publication.
-3. Re-run the low-cost checks (JSON validity, relative links, private-path scan)
-   after any further edits.
-4. Review `README.md`, `LICENSING.md`, and `PUBLICATION_MANIFEST.md` for
-   accuracy against the final file set.
-5. Perform manual GitHub publication review (no Git operations were performed
-   by this agent).
+The initial public release is published. The following are optional
+future-work items, not blockers for this release:
+
+1. If a custom license is pursued later: confirm Class C scope, resolve the
+   commercial permission contact/channel, and obtain qualified legal review.
+2. Re-run the low-cost checks (JSON validity, relative links, private-path
+   scan) after any further edits.
+3. Review `README.md`, `LICENSING.md`, and `PUBLICATION_MANIFEST.md` for
+   accuracy against the file set.
 
 ## File count
 
